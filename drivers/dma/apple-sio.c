@@ -137,6 +137,7 @@ struct sio_tx {
 
 	bool terminated;
 	size_t period_len;
+	dma_addr_t buf_addr;
 	int nperiods;
 	int ninflight;
 	int next;
@@ -271,23 +272,26 @@ static struct dma_async_tx_descriptor *sio_prep_dma_cyclic(
 
 	init_completion(&siotx->done);
 	siotx->period_len = period_len;
+	siotx->buf_addr = buf_addr;
 	siotx->nperiods = nperiods;
 
-	for (i = 0; i < nperiods; i++) {
-		struct sio_coproc_desc *d;
+	if (nperiods <= SIO_MAX_NINFLIGHT) {
+		for (i = 0; i < nperiods; i++) {
+			struct sio_coproc_desc *d;
 
-		siotx->siodesc[i] = d = sio_alloc_desc(siochan->host);
-		if (!d) {
-			siotx->vd.tx.chan = &siochan->vc.chan;
-			sio_tx_free(&siotx->vd);
-			return NULL;
+			siotx->siodesc[i] = d = sio_alloc_desc(siochan->host);
+			if (!d) {
+				siotx->vd.tx.chan = &siochan->vc.chan;
+				sio_tx_free(&siotx->vd);
+				return NULL;
+			}
+
+			d->flag = 1; /* not sure what's up with this */
+			d->iova = buf_addr + period_len * i;
+			d->size = period_len;
 		}
-
-		d->flag = 1; /* not sure what's up with this */
-		d->iova = buf_addr + period_len * i;
-		d->size = period_len;
+		dma_wmb();
 	}
-	dma_wmb();
 
 	return vchan_tx_prep(&siochan->vc, &siotx->vd, flags);
 }
@@ -367,6 +371,17 @@ static bool sio_fill_in_locked(struct sio_chan *siochan)
 
 	if (tx->ninflight >= SIO_MAX_NINFLIGHT || tx->terminated)
 		return false;
+
+	if (!d) {
+		d = sio_alloc_desc(sio);
+		if (!d)
+			return false;
+		d->flag = 1;
+		d->iova = tx->buf_addr + tx->period_len * tx->next;
+		d->size = tx->period_len;
+		tx->siodesc[tx->next] = d;
+		dma_wmb();
+	}
 
 	static_assert(sizeof(dma_cookie_t) <= sizeof(void *));
 	ret = sio_send_siomsg_atomic(sio, FIELD_PREP(SIOMSG_EP, siochan->no) |
@@ -497,8 +512,19 @@ static void sio_process_report(struct sio_chan *siochan)
 	if (siochan->current_tx) {
 		struct sio_tx *tx = siochan->current_tx;
 
-		if (tx->ninflight)
+		if (tx->ninflight) {
+			if (tx->nperiods > SIO_MAX_NINFLIGHT) {
+				int idx = tx->next - tx->ninflight;
+
+				if (idx < 0)
+					idx += tx->nperiods;
+				if (tx->siodesc[idx]) {
+					sio_free_desc(siochan->host, tx->siodesc[idx]);
+					tx->siodesc[idx] = NULL;
+				}
+			}
 			tx->ninflight--;
+		}
 		vchan_cyclic_callback(&tx->vd);
 		if (!sio_fill_in_locked(siochan) && !tx->ninflight)
 			complete(&tx->done);
