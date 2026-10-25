@@ -72,6 +72,13 @@ struct audiosrv_data {
 static void av_interface_init(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	mutex_lock(&asrv->plug_lock);
+	if (asrv->is_open && asrv->audio_dev)
+		dcpaud_connect(asrv->audio_dev, asrv->plugged);
+	mutex_unlock(&asrv->plug_lock);
 }
 
 static void av_interface_teardown(struct apple_epic_service *service)
@@ -119,6 +126,7 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	up_write(&asrv->srv_rwsem);
 
 	asrv->plugged = false;
+	asrv->is_open = false;
 	if (asrv->audio_dev)
 		dcpaud_disconnect(asrv->audio_dev);
 
@@ -132,6 +140,10 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
 			       64);
@@ -147,6 +159,10 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
 			       64);
@@ -162,6 +178,10 @@ int dcp_audiosrv_stoplink(struct device *dev)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
 			       NULL, 0, 64);
 	up_write(&asrv->srv_rwsem);
@@ -176,6 +196,10 @@ int dcp_audiosrv_unprepare(struct device *dev)
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
 			       NULL, 0, 64);
 	up_write(&asrv->srv_rwsem);
@@ -227,6 +251,10 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = dcp_audiosrv_osobject_call(asrv->srv, 1, asrv->cmds.get_elements,
 					 elements, maxsize, &size);
 	up_write(&asrv->srv_rwsem);
@@ -249,6 +277,10 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
 	int ret;
 
 	down_write(&asrv->srv_rwsem);
+	if (!asrv->srv) {
+		up_write(&asrv->srv_rwsem);
+		return -ENODEV;
+	}
 	ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
 					 asrv->cmds.get_product_attrs, attrs,
 					 maxsize, &size);
@@ -304,15 +336,15 @@ void av_service_connect(struct apple_dcp *dcp)
 
 	/* open AV audio service */
 	dev_info(dcp->dev, "%s: starting audio service, plugged:%d\n", __func__,  asrv->plugged);
-	if (asrv->is_open)
-		return;
-
-	ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
-			       NULL, 0, 32);
-	if (ret) {
-		dev_err(dcp->dev, "error opening audio service: %d\n", ret);
-		return;
+	if (!asrv->is_open) {
+		ret = afk_service_call(service, 0, asrv->cmds.open, NULL, 0, 32,
+				       NULL, 0, 32);
+		if (ret) {
+			dev_err(dcp->dev, "error opening audio service: %d\n", ret);
+			return;
+		}
 	}
+
 	mutex_lock(&asrv->plug_lock);
 	asrv->is_open = true;
 
